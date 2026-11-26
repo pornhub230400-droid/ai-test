@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitoraggio Video AI 24/7 (Cloud Worker)
-=========================================
-Nessun link telecamera, nome o token Telegram Ã¨ presente in questo file.
-Tutti i dati sensibili vengono letti esclusivamente dalla variabile cifrata
-di ambiente MOLO_CONFIG (GitHub Encrypted Secrets).
+Monitoraggio Video AI 24/7 (Cloud Worker v2 â€” Anti-Blocco + Comandi Telegram)
+=============================================================================
+- Lettura flussi HLS in thread dedicati con watchdog anti-blocco (mai freeze)
+- Risoluzione AI potenziata (imgsz=1280) per visione notturna e molo lungo
+- Invio automatico Foto HD + Clip Video MP4 (6 sec) ad ogni persona rilevata
+- Comandi interattivi su Telegram: scrivi /foto o /stato in chat per ricevere
+  in qualsiasi momento le foto live delle telecamere dal server Cloud!
 """
 
 import json
 import os
+
+# Timeout di rete FFmpeg a 8 secondi per impedire qualsiasi blocco su stream HLS
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rw_timeout;8000000"
+
 import re
 import shutil
 import subprocess
@@ -27,8 +33,9 @@ from ultralytics import YOLO
 
 TZ_ITALIA = timezone(timedelta(hours=1))
 
-CONFIDENCE_THRESHOLD = 0.45
-COOLDOWN_TELEGRAM_SEC = 45
+CONFIDENCE_THRESHOLD = 0.38
+YOLO_IMGSZ = 1280
+COOLDOWN_TELEGRAM_SEC = 35
 FPS_ANALISI = 2
 DURATA_MASSIMA_SEC = int(float(os.environ.get("MAX_RUN_HOURS", "5.4")) * 3600)
 
@@ -48,15 +55,15 @@ def carica_config_cifrata():
     if not raw:
         raise RuntimeError(
             "Variabile cifrata MOLO_CONFIG mancante! "
-            "Inseriscila in GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret."
+            "Inseriscila in GitHub -> Settings -> Secrets and variables -> Actions."
         )
     return json.loads(raw)
 
 
-def risolvi_stream_rtsp_me(embed_url: str, max_tentativi_risveglio: int = 10):
+def risolvi_stream_rtsp_me(embed_url: str, max_tentativi_risveglio: int = 8):
     m = re.search(r"rtsp\.me/embed/([A-Za-z0-9_-]+)", embed_url)
     if not m:
-        return embed_url, time.time() + 3600
+        return embed_url, time.time() + 900
 
     cam_id = m.group(1)
     session = requests.Session()
@@ -86,20 +93,87 @@ def risolvi_stream_rtsp_me(embed_url: str, max_tentativi_risveglio: int = 10):
     data2 = resp2.json()
 
     hls_url = data2.get("hls") or data2.get("ios")
-    expires = float(data2.get("expires", time.time() + 1800))
+    expires = min(float(data2.get("expires", time.time() + 900)), time.time() + 600)
     if not hls_url:
         raise RuntimeError("Nessun URL HLS disponibile")
 
     for _ in range(max_tentativi_risveglio):
         try:
-            r_hls = session.get(hls_url, headers={"Referer": "https://rtsp.me/"}, timeout=8)
+            r_hls = session.get(hls_url, headers={"Referer": "https://rtsp.me/"}, timeout=6)
             if r_hls.status_code == 200 and "#EXTM3U" in r_hls.text:
                 return hls_url, expires
         except Exception:
             pass
-        time.sleep(1.2)
+        time.sleep(1.0)
 
     return hls_url, expires
+
+
+class CameraWatchdogStream:
+    """
+    Legge lo stream HLS in un thread separato con watchdog anti-blocco:
+    se lo stream si ferma per oltre 12 secondi o il token scade (ogni 10 min),
+    riconnette in background senza mai bloccare il motore AI.
+    """
+
+    def __init__(self, idx: int, name: str, embed_url: str):
+        self.idx = idx
+        self.label = f"Cam-{idx}"
+        self.name = name
+        self.embed_url = embed_url
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.last_frame_ts = 0.0
+        self.frame_seq = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        cap = None
+        expires = 0.0
+        while self.running:
+            now = time.time()
+            stalled = (now - self.last_frame_ts) > 15.0 and self.last_frame_ts > 0
+            if cap is None or not cap.isOpened() or now >= expires or stalled:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                try:
+                    hls_url, expires = risolvi_stream_rtsp_me(self.embed_url)
+                    cap = cv2.VideoCapture(hls_url)
+                    if cap.isOpened():
+                        ret, frm = cap.read()
+                        if ret and frm is not None:
+                            with self.lock:
+                                self.latest_frame = frm
+                                self.last_frame_ts = time.time()
+                                self.frame_seq += 1
+                            log(f"Stream [{self.label}] attivo.")
+                            continue
+                except Exception:
+                    pass
+                time.sleep(2.5)
+                continue
+
+            ret, frm = cap.read()
+            if ret and frm is not None:
+                with self.lock:
+                    self.latest_frame = frm
+                    self.last_frame_ts = time.time()
+                    self.frame_seq += 1
+            else:
+                time.sleep(0.2)
+
+    def get_latest(self, last_seen_seq: int):
+        with self.lock:
+            if self.latest_frame is None or self.frame_seq == last_seen_seq:
+                return None, last_seen_seq
+            if (time.time() - self.last_frame_ts) > 20.0:
+                return None, last_seen_seq
+            return self.latest_frame.copy(), self.frame_seq
 
 
 def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, messaggio: str):
@@ -109,7 +183,7 @@ def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, mes
     if tg_img.shape[1] > 1280:
         h_new = int(tg_img.shape[0] * (1280 / tg_img.shape[1]))
         tg_img = cv2.resize(tg_img, (1280, h_new))
-    ok, buf = cv2.imencode(".jpg", tg_img, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    ok, buf = cv2.imencode(".jpg", tg_img, [int(cv2.IMWRITE_JPEG_QUALITY), 84])
     if not ok:
         return
     jpg_bytes = buf.tobytes()
@@ -117,16 +191,14 @@ def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, mes
     def _worker():
         url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
         try:
-            resp = requests.post(
+            requests.post(
                 url,
                 data={"chat_id": chat_id, "caption": messaggio},
                 files={"photo": ("allarme.jpg", jpg_bytes, "image/jpeg")},
                 timeout=30,
             )
-            if resp.status_code != 200:
-                log("Avviso servizio notifiche")
         except Exception:
-            log("Errore di rete durante invio Telegram")
+            pass
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -168,7 +240,7 @@ def invia_video_telegram(bot_token: str, chat_id: str, frames_bgr: list, caption
                     timeout=45,
                 )
         except Exception:
-            log("Errore invio clip video")
+            pass
         finally:
             for p in (tmp_raw, tmp_h264):
                 if os.path.exists(p):
@@ -204,30 +276,29 @@ def main():
     avvio_ts = time.time()
     cfg = carica_config_cifrata()
     bot_token = cfg["telegram_bot_token"]
-    chat_id = cfg["telegram_chat_id"]
+    chat_id = str(cfg["telegram_chat_id"])
     cameras = cfg["cameras"]
     rois = cfg.get("rois", {})
 
-    log(f"Avvio Monitoraggio Cloud 24/7 ({len(cameras)} telecamere configurate)...")
+    log(f"Avvio Monitoraggio Cloud 24/7 v2 ({len(cameras)} telecamere configurate)...")
     model = YOLO("yolov8n.pt")
 
     if os.environ.get("SEND_STARTUP_MSG", "1") == "1":
         invia_messaggio_telegram(
             bot_token,
             chat_id,
-            "â˜ï¸ Server Cloud 24/7 ATTIVO (Configurazione Cifrata Privata)!\n"
+            "â˜ï¸ Server Cloud 24/7 v2 ATTIVO (Anti-Blocco + Visione Notturna 1280p)!\n"
             f"ðŸ“· Telecamere sorvegliate: {', '.join(cameras.keys())}\n"
-            "ðŸŸ¢ Il monitoraggio gira in cloud: puoi spegnere tranquillamente il PC.",
+            "ðŸ’¡ Suggerimento: scrivi /foto o /stato qui in chat in qualsiasi momento per ricevere subito le foto live!",
         )
 
     cams_state = [
         {
             "idx": idx + 1,
             "name": nome,
-            "embed_url": url,
-            "cap": None,
-            "expires": 0,
-            "fail_count": 0,
+            "stream": CameraWatchdogStream(idx + 1, nome, url),
+            "last_seq": -1,
+            "last_annotated": None,
             "last_telegram": 0.0,
             "buffer": deque(maxlen=14),
             "post_record_remaining": 0,
@@ -236,47 +307,61 @@ def main():
         for idx, (nome, url) in enumerate(cameras.items())
     ]
 
+    # Inizializza offset comandi Telegram per rispondere a /foto e /stato
+    last_update_id = 0
+    try:
+        r_up = requests.get(f"https://api.telegram.org/bot{bot_token}/getUpdates", timeout=8).json()
+        for u in r_up.get("result", []):
+            last_update_id = max(last_update_id, u["update_id"])
+    except Exception:
+        pass
+
+    last_cmd_check = 0.0
+    cicli_totali = 0
     intervallo = 1.0 / max(1, FPS_ANALISI)
 
     while (time.time() - avvio_ts) < DURATA_MASSIMA_SEC:
         t0 = time.time()
 
+        # Controlla ogni 4 secondi se l'utente ha scritto /foto o /stato su Telegram
+        if (t0 - last_cmd_check) >= 4.0:
+            last_cmd_check = t0
+            try:
+                r_up = requests.get(
+                    f"https://api.telegram.org/bot{bot_token}/getUpdates",
+                    params={"offset": last_update_id + 1, "timeout": 0},
+                    timeout=5,
+                ).json()
+                for u in r_up.get("result", []):
+                    last_update_id = max(last_update_id, u["update_id"])
+                    msg_obj = u.get("message") or {}
+                    txt = (msg_obj.get("text") or "").strip().lower()
+                    sender_chat = str((msg_obj.get("chat") or {}).get("id", ""))
+                    if sender_chat == chat_id and txt in ("/foto", "foto", "/stato", "stato"):
+                        now_str = datetime.now(TZ_ITALIA).strftime("%d/%m/%Y %H:%M:%S")
+                        inviate = 0
+                        for st in cams_state:
+                            if st["last_annotated"] is not None:
+                                invia_foto_telegram(
+                                    bot_token,
+                                    chat_id,
+                                    st["last_annotated"],
+                                    f"ðŸ“¸ Foto Live richiesta ({now_str})\nðŸ“· Telecamera: {st['name']}\nâœ… Controlli AI eseguiti: {cicli_totali}",
+                                )
+                                inviate += 1
+                        if inviate == 0:
+                            invia_messaggio_telegram(bot_token, chat_id, "â³ Connessione alle telecamere in corso, riprova tra 5 secondi.")
+            except Exception:
+                pass
+
         for state in cams_state:
             nome = state["name"]
-            cam_label = f"Cam-{state['idx']}"
-            embed_url = state["embed_url"]
-
-            need_refresh = (
-                state["cap"] is None
-                or not state["cap"].isOpened()
-                or time.time() > (state["expires"] - 60)
-                or state["fail_count"] >= 12
-            )
-            if need_refresh:
-                if state["cap"] is not None:
-                    try:
-                        state["cap"].release()
-                    except Exception:
-                        pass
-                try:
-                    hls_url, expires = risolvi_stream_rtsp_me(embed_url)
-                    state["cap"] = cv2.VideoCapture(hls_url)
-                    state["expires"] = expires
-                    state["fail_count"] = 0
-                    log(f"Stream [{cam_label}] connesso.")
-                except Exception:
-                    log(f"Riconnessione [{cam_label}] in corso...")
-                    time.sleep(3)
-                    continue
-
-            for _ in range(2):
-                state["cap"].grab()
-            ret, frame = state["cap"].read()
-            if not ret or frame is None:
-                state["fail_count"] += 1
+            frame, seq = state["stream"].get_latest(state["last_seq"])
+            if frame is None:
                 continue
+            state["last_seq"] = seq
+            cicli_totali += 1
 
-            state["fail_count"] = 0
             h, w = frame.shape[:2]
             roi_norm = rois.get(nome, [])
 
@@ -284,6 +369,7 @@ def main():
                 source=frame,
                 classes=[0],
                 conf=CONFIDENCE_THRESHOLD,
+                imgsz=YOLO_IMGSZ,
                 verbose=False,
             )
 
@@ -303,8 +389,14 @@ def main():
                     conf = float(box.conf[0])
                     piedi_x = int((x1 + x2) / 2)
                     piedi_y = int(y2)
+                    centro_y = int((y1 + y2) / 2)
 
-                    if punto_dentro_roi(piedi_x, piedi_y, roi_norm, w, h):
+                    # Rileva se i piedi oppure il baricentro sono dentro il poligono del molo
+                    sul_molo = punto_dentro_roi(piedi_x, piedi_y, roi_norm, w, h) or punto_dentro_roi(
+                        piedi_x, centro_y, roi_norm, w, h
+                    )
+
+                    if sul_molo:
                         persone_sul_molo += 1
                         max_conf = max(max_conf, conf)
                         color = (0, 0, 255)
@@ -313,14 +405,14 @@ def main():
                         color = (160, 160, 160)
                         label = f"Fuori zona ({conf:.0%})"
 
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
                     cv2.circle(annotated, (piedi_x, piedi_y), 6, color, -1)
                     cv2.putText(
                         annotated,
                         label,
                         (x1, max(25, y1 - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
+                        0.7,
                         color,
                         2,
                     )
@@ -337,6 +429,7 @@ def main():
                 2,
             )
 
+            state["last_annotated"] = annotated
             state["buffer"].append(annotated)
 
             if state["post_record_remaining"] > 0:
@@ -368,12 +461,6 @@ def main():
             time.sleep(intervallo - elapsed)
 
     log("Fine turno programmato (5.4 ore): avvio automatico turno successivo...")
-    for state in cams_state:
-        if state["cap"] is not None:
-            try:
-                state["cap"].release()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
