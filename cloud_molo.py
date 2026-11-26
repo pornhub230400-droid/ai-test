@@ -3,7 +3,7 @@
 """
 Monitoraggio Video AI 24/7 (Cloud Worker)
 =========================================
-Nessun link telecamera, nome o token Telegram è presente in questo file.
+Nessun link telecamera, nome o token Telegram Ã¨ presente in questo file.
 Tutti i dati sensibili vengono letti esclusivamente dalla variabile cifrata
 di ambiente MOLO_CONFIG (GitHub Encrypted Secrets).
 """
@@ -11,9 +11,13 @@ di ambiente MOLO_CONFIG (GitHub Encrypted Secrets).
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import cv2
@@ -101,7 +105,11 @@ def risolvi_stream_rtsp_me(embed_url: str, max_tentativi_risveglio: int = 10):
 def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, messaggio: str):
     if not bot_token or not chat_id:
         return
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    tg_img = frame_bgr
+    if tg_img.shape[1] > 1280:
+        h_new = int(tg_img.shape[0] * (1280 / tg_img.shape[1]))
+        tg_img = cv2.resize(tg_img, (1280, h_new))
+    ok, buf = cv2.imencode(".jpg", tg_img, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
     if not ok:
         return
     jpg_bytes = buf.tobytes()
@@ -113,12 +121,61 @@ def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, mes
                 url,
                 data={"chat_id": chat_id, "caption": messaggio},
                 files={"photo": ("allarme.jpg", jpg_bytes, "image/jpeg")},
-                timeout=15,
+                timeout=30,
             )
             if resp.status_code != 200:
                 log("Avviso servizio notifiche")
         except Exception:
             log("Errore di rete durante invio Telegram")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def invia_video_telegram(bot_token: str, chat_id: str, frames_bgr: list, caption: str, fps: int = 3):
+    if not bot_token or not chat_id or not frames_bgr:
+        return
+
+    def _worker():
+        tmp_raw = os.path.join(tempfile.gettempdir(), f"raw_{int(time.time()*1000)}.mp4")
+        tmp_h264 = os.path.join(tempfile.gettempdir(), f"clip_{int(time.time()*1000)}.mp4")
+        send_file = tmp_raw
+        try:
+            writer = cv2.VideoWriter(tmp_raw, cv2.VideoWriter_fourcc(*"mp4v"), max(1, fps), (960, 540))
+            for f in frames_bgr:
+                writer.write(cv2.resize(f, (960, 540)))
+            writer.release()
+
+            if shutil.which("ffmpeg"):
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-i", tmp_raw,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        tmp_h264,
+                    ],
+                    timeout=25,
+                    check=False,
+                )
+                if os.path.exists(tmp_h264) and os.path.getsize(tmp_h264) > 1000:
+                    send_file = tmp_h264
+
+            with open(send_file, "rb") as vf:
+                requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendVideo",
+                    data={"chat_id": chat_id, "caption": caption, "supports_streaming": "true"},
+                    files={"video": ("allarme_molo.mp4", vf, "video/mp4")},
+                    timeout=45,
+                )
+        except Exception:
+            log("Errore invio clip video")
+        finally:
+            for p in (tmp_raw, tmp_h264):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -158,9 +215,9 @@ def main():
         invia_messaggio_telegram(
             bot_token,
             chat_id,
-            "☁️ Server Cloud 24/7 ATTIVO (Configurazione Cifrata Privata)!\n"
-            f"📷 Telecamere sorvegliate: {', '.join(cameras.keys())}\n"
-            "🟢 Il monitoraggio gira in cloud: puoi spegnere tranquillamente il PC.",
+            "â˜ï¸ Server Cloud 24/7 ATTIVO (Configurazione Cifrata Privata)!\n"
+            f"ðŸ“· Telecamere sorvegliate: {', '.join(cameras.keys())}\n"
+            "ðŸŸ¢ Il monitoraggio gira in cloud: puoi spegnere tranquillamente il PC.",
         )
 
     cams_state = [
@@ -172,6 +229,9 @@ def main():
             "expires": 0,
             "fail_count": 0,
             "last_telegram": 0.0,
+            "buffer": deque(maxlen=14),
+            "post_record_remaining": 0,
+            "pending_clip_caption": "",
         }
         for idx, (nome, url) in enumerate(cameras.items())
     ]
@@ -277,16 +337,31 @@ def main():
                 2,
             )
 
+            state["buffer"].append(annotated)
+
+            if state["post_record_remaining"] > 0:
+                state["post_record_remaining"] -= 1
+                if state["post_record_remaining"] == 0:
+                    invia_video_telegram(
+                        bot_token,
+                        chat_id,
+                        list(state["buffer"]),
+                        state["pending_clip_caption"],
+                        fps=max(2, FPS_ANALISI),
+                    )
+
             now_ts = time.time()
             if persone_sul_molo > 0 and (now_ts - state["last_telegram"] >= COOLDOWN_TELEGRAM_SEC):
                 state["last_telegram"] = now_ts
                 msg = (
-                    f"🚨 PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
-                    f"📷 Telecamera: {nome}\n"
-                    f"🕒 Ora: {now_str}\n"
-                    f"👤 Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})"
+                    f"ðŸš¨ PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
+                    f"ðŸ“· Telecamera: {nome}\n"
+                    f"ðŸ•’ Ora: {now_str}\n"
+                    f"ðŸ‘¤ Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})"
                 )
                 invia_foto_telegram(bot_token, chat_id, annotated, msg)
+                state["pending_clip_caption"] = f"ðŸŽ¥ Video rilevamento (6 sec) â€” Cam: {nome} ({now_str})"
+                state["post_record_remaining"] = 8
 
         elapsed = time.time() - t0
         if elapsed < intervallo:
