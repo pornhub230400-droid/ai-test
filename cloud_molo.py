@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitoraggio Video AI 24/7 (Cloud Worker v3 — FFmpeg Linux Nativo + Auto-Foto Avvio)
-====================================================================================
-- Risveglio completo dello stream RTSP.ME (fino a 30s) senza reset prematuro del token
-- Lettore ibrido OpenCV + FFmpeg nativo Linux (compatibile al 100% con segmenti fMP4 .m4s)
-- Invio AUTOMATICO della prima foto live su Telegram appena le telecamere si connettono
-- Zoom digitale nativo 1:1 sull'area del poligono + YOLOv8s (1280p)
-- Ignora completamente qualsiasi oggetto fuori dal poligono azzurro del molo
-- Invio automatico Foto HD + Clip Video MP4 (6 sec) ad ogni persona rilevata
-- Comandi interattivi su Telegram: /foto e /stato
+Monitoraggio Video AI 24/7 (Cloud Worker v4 — Anti-Oggetti Fissi + FFmpeg Linux)
+================================================================================
+- Filtro Movimento (Background Subtractor): ignora corrimano, colonnine e oggetti fissi
+- Blocco Anti-Ripetizione: non invia mai messaggi ripetuti sullo stesso punto
+- Soglia confidenza 58% (scarta riflessi/oggetti al 42%, rileva persone vere 77-85%)
+- Lettore ibrido OpenCV + FFmpeg nativo Linux + Auto-Foto Avvio + Comando /foto
 """
 
 import json
@@ -31,9 +28,9 @@ from ultralytics import YOLO
 
 TZ_ITALIA = timezone(timedelta(hours=1))
 
-CONFIDENCE_THRESHOLD = 0.38
+CONFIDENCE_THRESHOLD = 0.58
 YOLO_IMGSZ = 1280
-COOLDOWN_TELEGRAM_SEC = 35
+COOLDOWN_TELEGRAM_SEC = 60
 FPS_ANALISI = 2
 DURATA_MASSIMA_SEC = int(float(os.environ.get("MAX_RUN_HOURS", "5.4")) * 3600)
 
@@ -350,6 +347,36 @@ def punto_dentro_roi(px: int, py: int, roi_norm, w: int, h: int) -> bool:
     return cv2.pointPolygonTest(pts, (float(px), float(py)), False) >= 0
 
 
+def oggetto_in_movimento(frame_gray: np.ndarray, bg_float: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bool:
+    """
+    Confronta il riquadro rilevato con lo sfondo storico del molo:
+    se è un oggetto fisso (corrimano, colonnina, bitta, barca ormeggiata),
+    non c'è variazione rispetto allo sfondo e viene ignorato al 100%.
+    """
+    if bg_float is None:
+        return False
+    h, w = frame_gray.shape[:2]
+    bx1, by1 = max(0, x1), max(0, y1)
+    bx2, by2 = min(w, x2), min(h, y2)
+    if (bx2 - bx1) < 8 or (by2 - by1) < 8:
+        return False
+    roi_curr = frame_gray[by1:by2, bx1:bx2]
+    roi_bg = cv2.convertScaleAbs(bg_float[by1:by2, bx1:bx2])
+    diff = cv2.absdiff(roi_curr, roi_bg)
+    changed_ratio = float(np.count_nonzero(diff > 22)) / float(diff.size)
+    return changed_ratio >= 0.10
+
+
+def bersaglio_gia_notificato(cx: int, cy: int, last_points: list, soglia_px: int = 55) -> bool:
+    """
+    Impedisce l'invio di messaggi ripetuti per un bersaglio fermo nello stesso punto.
+    """
+    for px, py in last_points:
+        if ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 < soglia_px:
+            return True
+    return False
+
+
 def main():
     avvio_ts = time.time()
     cfg = carica_config_cifrata()
@@ -358,16 +385,15 @@ def main():
     cameras = cfg["cameras"]
     rois = cfg.get("rois", {})
 
-    log(f"Avvio Monitoraggio Cloud 24/7 v3 ({len(cameras)} telecamere configurate)...")
+    log(f"Avvio Monitoraggio Cloud 24/7 v4 ({len(cameras)} telecamere configurate)...")
     model = YOLO("yolov8s.pt")
 
     if os.environ.get("SEND_STARTUP_MSG", "1") == "1":
         invia_messaggio_telegram(
             bot_token,
             chat_id,
-            "☁️ Server Cloud 24/7 v3 AVVIATO!\n"
-            f"📷 Connessione in corso a: {', '.join(cameras.keys())}...\n"
-            "📸 Appena ogni telecamera è online (circa 15-25 secondi), riceverai qui automaticamente la prima foto di conferma!",
+            "☁️ Server Cloud 24/7 v4 AVVIATO (Filtro Anti-Oggetti Fissi attivo)!\n"
+            f"📷 Connessione in corso a: {', '.join(cameras.keys())}...",
         )
 
     cams_state = [
@@ -377,6 +403,8 @@ def main():
             "stream": CameraWatchdogStream(idx + 1, nome, url),
             "last_seq": -1,
             "last_annotated": None,
+            "bg_float": None,
+            "last_alarm_points": [],
             "sent_first_photo": False,
             "last_telegram": 0.0,
             "buffer": deque(maxlen=12),
@@ -447,6 +475,10 @@ def main():
 
             h, w = frame.shape[:2]
             roi_norm = rois.get(nome, [])
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_gray = cv2.GaussianBlur(frame_gray, (5, 5), 0)
+            if state["bg_float"] is None or state["bg_float"].shape != frame_gray.shape:
+                state["bg_float"] = frame_gray.astype(np.float32)
 
             if roi_norm and len(roi_norm) >= 3:
                 xs = [int(pt[0] * w) for pt in roi_norm]
@@ -475,6 +507,7 @@ def main():
 
             persone_sul_molo = 0
             max_conf = 0.0
+            current_points = []
 
             for r in results:
                 if r.boxes is None:
@@ -493,7 +526,14 @@ def main():
                     if not sul_molo:
                         continue
 
+                    if not oggetto_in_movimento(frame_gray, state["bg_float"], x1, y1, x2, y2):
+                        continue
+
+                    if bersaglio_gia_notificato(piedi_x, centro_y, state["last_alarm_points"]):
+                        continue
+
                     persone_sul_molo += 1
+                    current_points.append((piedi_x, centro_y))
                     max_conf = max(max_conf, conf)
                     color = (0, 0, 255)
                     label = f"PERSONA RILEVATA ({conf:.0%})"
@@ -510,12 +550,18 @@ def main():
                         2,
                     )
 
+            if persone_sul_molo == 0:
+                state["last_alarm_points"] = []
+
+            alpha_bg = 0.02 if persone_sul_molo > 0 else 0.12
+            cv2.accumulateWeighted(frame_gray, state["bg_float"], alpha_bg)
+
             now_str = datetime.now(TZ_ITALIA).strftime("%d/%m/%Y %H:%M:%S")
             status_color = (0, 0, 255) if persone_sul_molo > 0 else (0, 200, 0)
             cv2.putText(
                 annotated,
                 f"CLOUD 24/7 | Cam: {nome} | {now_str} | Persone: {persone_sul_molo}",
-                (15, 35),
+                (15, 85),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.75,
                 status_color,
@@ -548,6 +594,7 @@ def main():
             now_ts = time.time()
             if persone_sul_molo > 0 and (now_ts - state["last_telegram"] >= COOLDOWN_TELEGRAM_SEC):
                 state["last_telegram"] = now_ts
+                state["last_alarm_points"] = current_points
                 msg = (
                     f"🚨 PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
                     f"📷 Telecamera: {nome}\n"
