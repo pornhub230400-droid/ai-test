@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitoraggio Video AI 24/7 (Cloud Worker v2 â€” Anti-Blocco + Comandi Telegram)
-=============================================================================
+Monitoraggio Video AI 24/7 (Cloud Worker v2 — Anti-Blocco + Zoom 1:1 + Comandi Telegram)
+========================================================================================
 - Lettura flussi HLS in thread dedicati con watchdog anti-blocco (mai freeze)
-- Risoluzione AI potenziata (imgsz=1280) per visione notturna e molo lungo
+- Zoom digitale nativo 1:1 sull'area del poligono + YOLOv8s (1280p) per visione notturna
+- Ignora e nasconde completamente qualsiasi oggetto fuori dal poligono azzurro del molo
 - Invio automatico Foto HD + Clip Video MP4 (6 sec) ad ogni persona rilevata
 - Comandi interattivi su Telegram: scrivi /foto o /stato in chat per ricevere
   in qualsiasi momento le foto live delle telecamere dal server Cloud!
@@ -112,7 +113,7 @@ def risolvi_stream_rtsp_me(embed_url: str, max_tentativi_risveglio: int = 8):
 class CameraWatchdogStream:
     """
     Legge lo stream HLS in un thread separato con watchdog anti-blocco:
-    se lo stream si ferma per oltre 12 secondi o il token scade (ogni 10 min),
+    se lo stream si ferma per oltre 15 secondi o il token scade (ogni 10 min),
     riconnette in background senza mai bloccare il motore AI.
     """
 
@@ -281,15 +282,15 @@ def main():
     rois = cfg.get("rois", {})
 
     log(f"Avvio Monitoraggio Cloud 24/7 v2 ({len(cameras)} telecamere configurate)...")
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolov8s.pt")
 
     if os.environ.get("SEND_STARTUP_MSG", "1") == "1":
         invia_messaggio_telegram(
             bot_token,
             chat_id,
-            "â˜ï¸ Server Cloud 24/7 v2 ATTIVO (Anti-Blocco + Visione Notturna 1280p)!\n"
-            f"ðŸ“· Telecamere sorvegliate: {', '.join(cameras.keys())}\n"
-            "ðŸ’¡ Suggerimento: scrivi /foto o /stato qui in chat in qualsiasi momento per ricevere subito le foto live!",
+            "☁️ Server Cloud 24/7 v2 ATTIVO (Anti-Blocco + Zoom 1:1 YOLOv8s 1280p)!\n"
+            f"📷 Telecamere sorvegliate: {', '.join(cameras.keys())}\n"
+            "💡 Suggerimento: scrivi /foto o /stato qui in chat in qualsiasi momento per ricevere subito le foto live!",
         )
 
     cams_state = [
@@ -307,7 +308,6 @@ def main():
         for idx, (nome, url) in enumerate(cameras.items())
     ]
 
-    # Inizializza offset comandi Telegram per rispondere a /foto e /stato
     last_update_id = 0
     try:
         r_up = requests.get(f"https://api.telegram.org/bot{bot_token}/getUpdates", timeout=8).json()
@@ -323,7 +323,6 @@ def main():
     while (time.time() - avvio_ts) < DURATA_MASSIMA_SEC:
         t0 = time.time()
 
-        # Controlla ogni 4 secondi se l'utente ha scritto /foto o /stato su Telegram
         if (t0 - last_cmd_check) >= 4.0:
             last_cmd_check = t0
             try:
@@ -346,11 +345,11 @@ def main():
                                     bot_token,
                                     chat_id,
                                     st["last_annotated"],
-                                    f"ðŸ“¸ Foto Live richiesta ({now_str})\nðŸ“· Telecamera: {st['name']}\nâœ… Controlli AI eseguiti: {cicli_totali}",
+                                    f"📸 Foto Live richiesta ({now_str})\n📷 Telecamera: {st['name']}\n✅ Controlli AI eseguiti: {cicli_totali}",
                                 )
                                 inviate += 1
                         if inviate == 0:
-                            invia_messaggio_telegram(bot_token, chat_id, "â³ Connessione alle telecamere in corso, riprova tra 5 secondi.")
+                            invia_messaggio_telegram(bot_token, chat_id, "⏳ Connessione alle telecamere in corso, riprova tra 5 secondi.")
             except Exception:
                 pass
 
@@ -365,8 +364,21 @@ def main():
             h, w = frame.shape[:2]
             roi_norm = rois.get(nome, [])
 
+            # Ritaglio nativo 1:1 sull'area del poligono del molo (zoom digitale senza perdita di pixel)
+            if roi_norm and len(roi_norm) >= 3:
+                xs = [int(pt[0] * w) for pt in roi_norm]
+                ys = [int(pt[1] * h) for pt in roi_norm]
+                x0 = max(0, min(xs) - 80)
+                y0 = max(0, min(ys) - 80)
+                x1_roi = min(w, max(xs) + 80)
+                y1_roi = min(h, max(ys) + 80)
+                crop_img = frame[y0:y1_roi, x0:x1_roi]
+            else:
+                x0, y0 = 0, 0
+                crop_img = frame
+
             results = model.predict(
-                source=frame,
+                source=crop_img,
                 classes=[0],
                 conf=CONFIDENCE_THRESHOLD,
                 imgsz=YOLO_IMGSZ,
@@ -385,25 +397,25 @@ def main():
                 if r.boxes is None:
                     continue
                 for box in r.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                    x1, y1, x2, y2 = bx1 + x0, by1 + y0, bx2 + x0, by2 + y0
                     conf = float(box.conf[0])
                     piedi_x = int((x1 + x2) / 2)
                     piedi_y = int(y2)
                     centro_y = int((y1 + y2) / 2)
 
-                    # Rileva se i piedi oppure il baricentro sono dentro il poligono del molo
                     sul_molo = punto_dentro_roi(piedi_x, piedi_y, roi_norm, w, h) or punto_dentro_roi(
                         piedi_x, centro_y, roi_norm, w, h
                     )
 
-                    if sul_molo:
-                        persone_sul_molo += 1
-                        max_conf = max(max_conf, conf)
-                        color = (0, 0, 255)
-                        label = f"PERSONA RILEVATA ({conf:.0%})"
-                    else:
-                        color = (160, 160, 160)
-                        label = f"Fuori zona ({conf:.0%})"
+                    # Ignora completamente qualsiasi oggetto fuori dal poligono azzurro del molo
+                    if not sul_molo:
+                        continue
+
+                    persone_sul_molo += 1
+                    max_conf = max(max_conf, conf)
+                    color = (0, 0, 255)
+                    label = f"PERSONA RILEVATA ({conf:.0%})"
 
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
                     cv2.circle(annotated, (piedi_x, piedi_y), 6, color, -1)
@@ -447,13 +459,13 @@ def main():
             if persone_sul_molo > 0 and (now_ts - state["last_telegram"] >= COOLDOWN_TELEGRAM_SEC):
                 state["last_telegram"] = now_ts
                 msg = (
-                    f"ðŸš¨ PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
-                    f"ðŸ“· Telecamera: {nome}\n"
-                    f"ðŸ•’ Ora: {now_str}\n"
-                    f"ðŸ‘¤ Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})"
+                    f"🚨 PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
+                    f"📷 Telecamera: {nome}\n"
+                    f"🕒 Ora: {now_str}\n"
+                    f"👤 Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})"
                 )
                 invia_foto_telegram(bot_token, chat_id, annotated, msg)
-                state["pending_clip_caption"] = f"ðŸŽ¥ Video rilevamento (6 sec) â€” Cam: {nome} ({now_str})"
+                state["pending_clip_caption"] = f"🎥 Video rilevamento (6 sec) — Cam: {nome} ({now_str})"
                 state["post_record_remaining"] = 8
 
         elapsed = time.time() - t0
