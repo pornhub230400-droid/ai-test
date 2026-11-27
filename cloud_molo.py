@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitoraggio Video AI 24/7 (Cloud Worker v4 — Anti-Oggetti Fissi + FFmpeg Linux)
-================================================================================
+Monitoraggio Video AI 24/7 (Cloud Worker v5 — Video Fluido 1 Minuto + Anti-Oggetti Fissi)
+=========================================================================================
+- Video acquisito direttamente dallo stream nativo HLS via FFmpeg per 60 SECONDI (1 minuto)
+  a framerate nativo della telecamera (15-25 FPS reali, 100% fluido, zero scatti!)
+- Parte da ~4 secondi prima del rilevamento (-live_start_index -2) fino a 60 secondi
 - Filtro Movimento (Background Subtractor): ignora corrimano, colonnine e oggetti fissi
 - Blocco Anti-Ripetizione: non invia mai messaggi ripetuti sullo stesso punto
-- Soglia confidenza 58% (scarta riflessi/oggetti al 42%, rileva persone vere 77-85%)
-- Lettore ibrido OpenCV + FFmpeg nativo Linux + Auto-Foto Avvio + Comando /foto
+- Soglia confidenza 58% + Zoom digitale nativo 1:1 con YOLOv8s (1280p)
+- Comandi interattivi su Telegram:
+  • /foto o /stato -> ricevi subito le foto live delle telecamere
+  • /video         -> registra e ricevi su richiesta un video fluido dalle telecamere
 """
 
 import json
@@ -18,7 +23,6 @@ import sys
 import tempfile
 import time
 import threading
-from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import cv2
@@ -30,7 +34,8 @@ TZ_ITALIA = timezone(timedelta(hours=1))
 
 CONFIDENCE_THRESHOLD = 0.58
 YOLO_IMGSZ = 1280
-COOLDOWN_TELEGRAM_SEC = 60
+DURATA_VIDEO_ALLARME_SEC = 60
+COOLDOWN_TELEGRAM_SEC = 70
 FPS_ANALISI = 2
 DURATA_MASSIMA_SEC = int(float(os.environ.get("MAX_RUN_HOURS", "5.4")) * 3600)
 
@@ -143,6 +148,7 @@ class CameraWatchdogStream:
         self.latest_frame = None
         self.last_frame_ts = 0.0
         self.frame_seq = 0
+        self.current_hls_url = ""
         self.status_msg = "Avvio connessione..."
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -152,11 +158,12 @@ class CameraWatchdogStream:
         with self.lock:
             self.status_msg = msg
 
-    def _push_frame(self, frm: np.ndarray):
+    def _push_frame(self, frm: np.ndarray, hls_url: str):
         with self.lock:
             self.latest_frame = frm
             self.last_frame_ts = time.time()
             self.frame_seq += 1
+            self.current_hls_url = hls_url
             self.status_msg = f"Online (frame #{self.frame_seq})"
 
     def _loop(self):
@@ -193,7 +200,7 @@ class CameraWatchdogStream:
 
                     if frm is not None:
                         use_ffmpeg_fallback = False
-                        self._push_frame(frm)
+                        self._push_frame(frm, hls_url)
                         log(f"Stream [{self.label}] attivo (OpenCV).")
                         continue
 
@@ -207,7 +214,7 @@ class CameraWatchdogStream:
                     frm_ff = cattura_frame_ffmpeg(hls_url)
                     if frm_ff is not None:
                         use_ffmpeg_fallback = True
-                        self._push_frame(frm_ff)
+                        self._push_frame(frm_ff, hls_url)
                         log(f"Stream [{self.label}] attivo (FFmpeg nativo).")
                         continue
                     else:
@@ -222,18 +229,18 @@ class CameraWatchdogStream:
             if not use_ffmpeg_fallback and cap is not None and cap.isOpened():
                 ret, frm = cap.read()
                 if ret and frm is not None:
-                    self._push_frame(frm)
+                    self._push_frame(frm, hls_url)
                 else:
                     frm_ff = cattura_frame_ffmpeg(hls_url)
                     if frm_ff is not None:
                         use_ffmpeg_fallback = True
-                        self._push_frame(frm_ff)
+                        self._push_frame(frm_ff, hls_url)
                     else:
                         time.sleep(0.5)
             else:
                 frm_ff = cattura_frame_ffmpeg(hls_url)
                 if frm_ff is not None:
-                    self._push_frame(frm_ff)
+                    self._push_frame(frm_ff, hls_url)
                 else:
                     hls_url = ""
                     time.sleep(1.0)
@@ -245,6 +252,10 @@ class CameraWatchdogStream:
             if (time.time() - self.last_frame_ts) > 30.0:
                 return None, last_seen_seq
             return self.latest_frame.copy(), self.frame_seq
+
+    def get_hls_url(self) -> str:
+        with self.lock:
+            return self.current_hls_url
 
     def get_status(self) -> str:
         with self.lock:
@@ -278,51 +289,77 @@ def invia_foto_telegram(bot_token: str, chat_id: str, frame_bgr: np.ndarray, mes
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def invia_video_telegram(bot_token: str, chat_id: str, frames_bgr: list, caption: str, fps: int = 3):
-    if not bot_token or not chat_id or not frames_bgr:
+def registra_e_invia_video_fluido(
+    bot_token: str,
+    chat_id: str,
+    state: dict,
+    caption: str,
+    durata_sec: int = DURATA_VIDEO_ALLARME_SEC,
+):
+    if not bot_token or not chat_id:
+        return
+    if state.get("recording_video"):
         return
 
+    state["recording_video"] = True
+
     def _worker():
-        tmp_raw = os.path.join(tempfile.gettempdir(), f"raw_{int(time.time()*1000)}.mp4")
-        tmp_h264 = os.path.join(tempfile.gettempdir(), f"clip_{int(time.time()*1000)}.mp4")
-        send_file = tmp_raw
+        tmp_mp4 = os.path.join(
+            tempfile.gettempdir(), f"fluido_{state['idx']}_{int(time.time()*1000)}.mp4"
+        )
         try:
-            writer = cv2.VideoWriter(tmp_raw, cv2.VideoWriter_fourcc(*"mp4v"), max(1, fps), (960, 540))
-            for f in frames_bgr:
-                writer.write(cv2.resize(f, (960, 540)))
-            writer.release()
+            hls_url = state["stream"].get_hls_url()
+            if not hls_url:
+                hls_url, _ = risolvi_stream_rtsp_me(state["embed_url"])
 
-            if shutil.which("ffmpeg"):
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-loglevel", "error",
-                        "-i", tmp_raw,
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                        tmp_h264,
-                    ],
-                    timeout=25,
-                    check=False,
-                )
-                if os.path.exists(tmp_h264) and os.path.getsize(tmp_h264) > 1000:
-                    send_file = tmp_h264
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-user_agent", USER_AGENT,
+                "-headers", "Referer: https://rtsp.me/\r\nOrigin: https://rtsp.me\r\n",
+                "-live_start_index", "-2",
+                "-i", hls_url,
+                "-t", str(durata_sec),
+                "-vf", "scale=1280:-2",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "26",
+                "-maxrate", "1500k",
+                "-bufsize", "3000k",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-an",
+                tmp_mp4,
+            ]
+            subprocess.run(cmd, timeout=durata_sec + 45, check=False)
 
-            with open(send_file, "rb") as vf:
-                requests.post(
-                    f"https://api.telegram.org/bot{bot_token}/sendVideo",
-                    data={"chat_id": chat_id, "caption": caption, "supports_streaming": "true"},
-                    files={"video": ("allarme_molo.mp4", vf, "video/mp4")},
-                    timeout=45,
-                )
+            if not os.path.exists(tmp_mp4) or os.path.getsize(tmp_mp4) < 5000:
+                hls_url, _ = risolvi_stream_rtsp_me(state["embed_url"])
+                cmd[cmd.index("-i") + 1] = hls_url
+                subprocess.run(cmd, timeout=durata_sec + 45, check=False)
+
+            if os.path.exists(tmp_mp4) and os.path.getsize(tmp_mp4) > 5000:
+                with open(tmp_mp4, "rb") as vf:
+                    requests.post(
+                        f"https://api.telegram.org/bot{bot_token}/sendVideo",
+                        data={
+                            "chat_id": chat_id,
+                            "caption": caption,
+                            "supports_streaming": "true",
+                        },
+                        files={"video": (f"video_{durata_sec}s.mp4", vf, "video/mp4")},
+                        timeout=120,
+                    )
         except Exception:
             pass
         finally:
-            for p in (tmp_raw, tmp_h264):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+            state["recording_video"] = False
+            if os.path.exists(tmp_mp4):
+                try:
+                    os.remove(tmp_mp4)
+                except Exception:
+                    pass
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -348,11 +385,6 @@ def punto_dentro_roi(px: int, py: int, roi_norm, w: int, h: int) -> bool:
 
 
 def oggetto_in_movimento(frame_gray: np.ndarray, bg_float: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bool:
-    """
-    Confronta il riquadro rilevato con lo sfondo storico del molo:
-    se è un oggetto fisso (corrimano, colonnina, bitta, barca ormeggiata),
-    non c'è variazione rispetto allo sfondo e viene ignorato al 100%.
-    """
     if bg_float is None:
         return False
     h, w = frame_gray.shape[:2]
@@ -368,9 +400,6 @@ def oggetto_in_movimento(frame_gray: np.ndarray, bg_float: np.ndarray, x1: int, 
 
 
 def bersaglio_gia_notificato(cx: int, cy: int, last_points: list, soglia_px: int = 55) -> bool:
-    """
-    Impedisce l'invio di messaggi ripetuti per un bersaglio fermo nello stesso punto.
-    """
     for px, py in last_points:
         if ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 < soglia_px:
             return True
@@ -385,21 +414,24 @@ def main():
     cameras = cfg["cameras"]
     rois = cfg.get("rois", {})
 
-    log(f"Avvio Monitoraggio Cloud 24/7 v4 ({len(cameras)} telecamere configurate)...")
+    log(f"Avvio Monitoraggio Cloud 24/7 v5 ({len(cameras)} telecamere, Video Fluido 60s)...")
     model = YOLO("yolov8s.pt")
 
     if os.environ.get("SEND_STARTUP_MSG", "1") == "1":
         invia_messaggio_telegram(
             bot_token,
             chat_id,
-            "☁️ Server Cloud 24/7 v4 AVVIATO (Filtro Anti-Oggetti Fissi attivo)!\n"
-            f"📷 Connessione in corso a: {', '.join(cameras.keys())}...",
+            "☁️ Server Cloud 24/7 v5 ATTIVO (Video Fluido 1 Minuto + Anti-Oggetti Fissi)!\n"
+            f"📷 Telecamere: {', '.join(cameras.keys())}\n"
+            "🎥 Ad ogni rilevamento riceverai subito la Foto dell'allarme e dopo 1 minuto il Video HD di 60 secondi fluido a FPS nativi!\n"
+            "💡 Comandi chat: /foto (foto istantanea) | /video (registra 1 minuto fluido su richiesta)",
         )
 
     cams_state = [
         {
             "idx": idx + 1,
             "name": nome,
+            "embed_url": url,
             "stream": CameraWatchdogStream(idx + 1, nome, url),
             "last_seq": -1,
             "last_annotated": None,
@@ -407,9 +439,7 @@ def main():
             "last_alarm_points": [],
             "sent_first_photo": False,
             "last_telegram": 0.0,
-            "buffer": deque(maxlen=12),
-            "post_record_remaining": 0,
-            "pending_clip_caption": "",
+            "recording_video": False,
         }
         for idx, (nome, url) in enumerate(cameras.items())
     ]
@@ -461,6 +491,21 @@ def main():
                                 bot_token,
                                 chat_id,
                                 "⏳ Stato connessione telecamere:\n" + "\n".join(stati),
+                            )
+                    elif sender_chat == chat_id and txt in ("/video", "video"):
+                        now_str = datetime.now(TZ_ITALIA).strftime("%d/%m/%Y %H:%M:%S")
+                        invia_messaggio_telegram(
+                            bot_token,
+                            chat_id,
+                            "🎥 Registrazione video fluido di 1 minuto (60s) avviata su entrambe le telecamere! Riceverai i video qui tra ~60 secondi.",
+                        )
+                        for st in cams_state:
+                            registra_e_invia_video_fluido(
+                                bot_token,
+                                chat_id,
+                                st,
+                                f"🎥 Video Live Fluido (60 sec) — Cam: {st['name']} ({now_str})",
+                                durata_sec=60,
                             )
             except Exception:
                 pass
@@ -569,7 +614,6 @@ def main():
             )
 
             state["last_annotated"] = annotated
-            state["buffer"].append(annotated)
 
             if not state["sent_first_photo"] and os.environ.get("SEND_STARTUP_MSG", "1") == "1":
                 state["sent_first_photo"] = True
@@ -580,17 +624,6 @@ def main():
                     f"✅ Telecamera [{nome}] CONNESSA al Cloud 24/7!\n🕒 {now_str}",
                 )
 
-            if state["post_record_remaining"] > 0:
-                state["post_record_remaining"] -= 1
-                if state["post_record_remaining"] == 0:
-                    invia_video_telegram(
-                        bot_token,
-                        chat_id,
-                        list(state["buffer"]),
-                        state["pending_clip_caption"],
-                        fps=max(2, FPS_ANALISI),
-                    )
-
             now_ts = time.time()
             if persone_sul_molo > 0 and (now_ts - state["last_telegram"] >= COOLDOWN_TELEGRAM_SEC):
                 state["last_telegram"] = now_ts
@@ -599,11 +632,17 @@ def main():
                     f"🚨 PERSONA RILEVATA SUL MOLO! (Cloud 24/7)\n"
                     f"📷 Telecamera: {nome}\n"
                     f"🕒 Ora: {now_str}\n"
-                    f"👤 Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})"
+                    f"👤 Persone rilevate: {persone_sul_molo} (conf. {max_conf:.0%})\n"
+                    f"🎥 Registrazione video fluido di 1 minuto in corso..."
                 )
                 invia_foto_telegram(bot_token, chat_id, annotated, msg)
-                state["pending_clip_caption"] = f"🎥 Video rilevamento — Cam: {nome} ({now_str})"
-                state["post_record_remaining"] = 4
+                registra_e_invia_video_fluido(
+                    bot_token,
+                    chat_id,
+                    state,
+                    f"🎥 Video Rilevamento Fluido (1 Minuto) — Cam: {nome} ({now_str})",
+                    durata_sec=DURATA_VIDEO_ALLARME_SEC,
+                )
 
         elapsed = time.time() - t0
         if elapsed < intervallo:
